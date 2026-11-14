@@ -14,7 +14,10 @@ BUILD = ROOT / "build" / "varying-test"
 
 
 def run(*args):
-    return subprocess.run([str(a) for a in args], check=True, capture_output=True, text=True)
+    result = subprocess.run([str(a) for a in args], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"{args}: exit {result.returncode}\n{result.stdout}\n{result.stderr}")
+    return result
 
 
 def words(path):
@@ -151,7 +154,7 @@ void main() { target = colour + vec4(float(material) * 0.0); }
         # Offset and negative viewport height, all-positive W, a vertex behind the camera, and a vertex at W=0.
         for viewport in ([0., 720., 1280., -720.], [17., 971., 1920., -1080.], [0., 0., 640., 360.]):
             for positions in ([[-2., -2., 0., 1.], [2., -2., 0., 1.], [0., 2., 0., 2.]],
-                              [[-10000., -10000., 0., 1.], [10000., -10000., 0., 1.], [0., 10000., 0., -1.]],
+                              [[-10000., -10000., 0., 1.], [10000., -10000., 0., 1.], [0., 10000., 0., -.5]],
                               [[-2., -2., 0., 1.], [2., -2., 0., 1.], [0., 2., 0., 0.]]):
                 values = [[.25, .5, .75, 1.], [.5, 1., 1.5, 2.], [1., 2., 3., 4.]]
                 actual = evaluate(fo, viewport, positions, {0: values})[0]

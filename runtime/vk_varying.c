@@ -66,6 +66,8 @@ static int parse(Module *m, const uint32_t *w, size_t n, unsigned stage) {
         const uint32_t *p = w + at;
         unsigned len = p[0] >> 16, op = p[0] & 65535;
         if (!len || len > n - at) return 0;
+        if (((op == POINTER || op == VECTOR || op == ARRAY || op == INT || op == VARIABLE || op == CONSTANT) && len < 4) ||
+            ((op == ACCESS || op == INACCESS || op == FUNCTION) && len < 5) || (op == FLOAT && len < 3)) return 0;
         uint32_t result = 0;
         if (op >= INT && op <= POINTER && len >= 2) result = p[1];
         else if ((op == VARIABLE || op == ACCESS || op == INACCESS || op == CONSTANT) && len >= 4) result = p[2];
@@ -79,9 +81,10 @@ static int parse(Module *m, const uint32_t *w, size_t n, unsigned stage) {
             if (op == VECTOR || op == ARRAY) d->element = p[2], d->count = p[3];
             if (op == VARIABLE) d->type = p[1], d->storage = p[3];
             if (op == ACCESS || op == INACCESS) d->type = p[1], d->root = p[3];
+            if (d->type >= m->bound || d->element >= m->bound || d->root >= m->bound) return 0;
         }
         if (op == ENTRY) {
-            if (len < 4 || p[1] != stage || ++entries != 1) return 0;
+            if (len < 4 || p[1] != stage || p[2] >= m->bound || !memchr(p + 3, 0, (len - 3) * 4) || ++entries != 1) return 0;
             m->entry = p[2];
         }
         if (op == MODE && len >= 3 && p[2] == 11) return 0; // transform feedback
@@ -254,11 +257,10 @@ static void declare(Pair *p) {
     for (uint32_t i = 1; i < f->bound; i++) {
         Id *d = &f->id[i];
         if (d->op != ACCESS && d->op != INACCESS) continue;
-        // Access chains are not necessarily ordered by result id.
-        for (unsigned step = 0; step < 64 && !p->root[i]; step++) {
-            uint32_t root = d->root;
-            for (unsigned depth = 0; root < f->bound && !p->root[root] && f->id[root].root && depth < 64; depth++) root = f->id[root].root;
-            if (root >= f->bound || !p->root[root]) break;
+        // Walk the base chain rather than relying on result-id order.
+        uint32_t root = d->root;
+        for (unsigned depth = 0; root < f->bound && !p->root[root] && f->id[root].root && depth < 64; depth++) root = f->id[root].root;
+        if (root < f->bound && p->root[root]) {
             p->root[i] = p->root[root];
             p->private_ptr[i] = pointer(f, PRIVATE, f->id[d->type].element);
         }
@@ -343,7 +345,6 @@ static int rewrite(Pair *p, Module *m, int fragment, Words *out) {
         if (op == ENTRY) {
             size_t prefix = 3;
             while (prefix < n && !memchr(s + prefix++, 0, 4)) {}
-            if (prefix > n) return 0;
             Words args = {0}; append(&args, s + 1, prefix - 1);
             for (size_t i = prefix; i < n; i++) {
                 if (fragment && s[i] < m->bound && p->root[s[i]] && w[1] < 0x00010400) continue;
