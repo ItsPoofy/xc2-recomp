@@ -34,7 +34,8 @@
 #define MAX_DESC 1024
 #define CHUNK_BYTES (4u << 20)
 #define ZERO_BYTES 65536u
-#define SUPPORT_BYTES 1408u   // Ryujinx SupportBuffer (std140): alpha_test, is_bgra[8], viewport_inverse, viewport_size, ...
+#include "vk_varying.h"
+#define SUPPORT_BYTES VK_VARYING_SUPPORT_BYTES
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
@@ -117,7 +118,7 @@ static struct {
     uint64_t vgen;
     int vb_valid;
     uint8_t support[SUPPORT_BYTES];      // last support buffer and where it lives
-    float sup_in[3];                     // the support_fill arguments it was filled from
+    float sup_in[5];                     // width, height, point size, viewport x, viewport y
     VkBuffer sup_buf;
     VkDeviceSize sup_off;
     int sup_valid;
@@ -155,7 +156,7 @@ typedef struct { int cls, use; uint64_t bytes; } RsCount;
 static struct {
     int on;                              // XC2_BIND_SKIP: 1 skip (default), 2 check, 0 off
     uint32_t hn;                         // words of h the last signature filled; 0: none
-    uint64_t h[28];                      // generations, feedback images, support inputs, base instance, glow inputs
+    uint64_t h[32];                      // generations, feedback images, support inputs, base instance, glow inputs
     const VkPipeInfo *info;              // the pipeline whose RsList ranges body holds, as of bind op generation gen
     uint64_t gen;
     uint8_t body[RS_BYTES];
@@ -1570,19 +1571,27 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     return VK_NULL_HANDLE;
 }
 
-static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
+static void support_in(const VkExec *ex, float in[5]) {
     in[0] = ex->in_pass && ex->has_vp ? ex->vp[0][2] : (float)ex->pass_w;
     in[1] = ex->in_pass && ex->has_vp ? ex->vp[0][3] : (float)ex->pass_h;
     in[2] = ex->point_size > 0 ? ex->point_size : 1.0f;
+    in[3] = ex->in_pass && ex->has_vp ? ex->vp[0][0] : 0;
+    in[4] = ex->in_pass && ex->has_vp ? ex->vp[0][1] : 0;
 }
 
-static void support_fill(uint8_t *b, float w, float h, float point_size) {
+static void support_fill(uint8_t *b, const float in[5]) {
+    float w = in[0], h = in[1], point_size = in[2];
     memset(b, 0, SUPPORT_BYTES);
     float inv[4] = {w > 0 ? 2.0f / w : 0, h > 0 ? 2.0f / h : 0, 0, 0}, size[4] = {w, h, 0, 0};
     memcpy(b + 144, inv, 16);
     memcpy(b + 160, size, 16);
     const float one = 1.0f;
     memcpy(b + 1392, &point_size, 4);   // point_size (translator patch 0008): vertex shaders that write none output it
+    // Match record_fixed's viewport, including its origin, negative height and clamping. This is dynamic data:
+    // camera/viewport changes reuse the pipeline but must never reuse the previous draw's support buffer.
+    float vw = w < 1 ? 1 : w, vh = h < 1 ? 1 : h;
+    float viewport[4] = {in[3], in[4] + vh, vw, -vh};
+    memcpy(b + VK_VARYING_VIEWPORT_OFFSET, viewport, sizeof viewport);
     for (int i = 0; i < 73; i++) memcpy(b + 192 + 16 * i, &one, 4);   // render scale 1: the host renders at guest size
 }
 
@@ -1765,13 +1774,15 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
     PUT(vk_mem_gen() + vk_usnap_gen());   // both only grow
     for (int i = 0; i < ex->nfbl && i < 9; i++) PUT((uintptr_t)ex->fbl_img[i]);
     if (l->sup) {
-        float in[3];
+        float in[5];
         support_in(ex, in);
         uint64_t a;
         uint32_t ps;
         memcpy(&a, in, 8), memcpy(&ps, &in[2], 4);
         PUT(a);
         PUT(ps);
+        memcpy(&a, &in[3], 8);
+        PUT(a);
     }
     if (l->c0) PUT(c0_binst);
     // glow_c4 decides by the pass size and by whether the draw is of quads: a draw with the bindings of the one before
@@ -1858,11 +1869,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
         if (b->kind == VK_PIPE_SUPPORT) {
-            float in[3];
+            float in[5];
             support_in(ex, in);
             if (!B.sup_valid || memcmp(in, B.sup_in, sizeof in)) {   // support_fill reads only these
                 uint8_t tmp[SUPPORT_BYTES];
-                support_fill(tmp, in[0], in[1], in[2]);
+                support_fill(tmp, in);
                 memcpy(B.sup_in, in, sizeof in);
                 if (!B.sup_valid || memcmp(tmp, B.support, SUPPORT_BYTES)) {   // a new buffer only when the contents changed
                     VkBuffer sb;

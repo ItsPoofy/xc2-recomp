@@ -53,6 +53,7 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#include "vk_varying.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -82,6 +83,7 @@ static struct {
     int dyn_vi, dyn_clamp, dyn_poly, dyn_blend_en, dyn_blend_eq, dyn_wmask, dyn_a2c;
     int f_logic_op, f_depth_clamp, f_fill_non_solid, f_dual_src;
     int pv_last;                       // provokingVertexLast enabled: NVN's default is the last vertex
+    int varying_repair;                // original-vertex interpolation on supported non-NVIDIA GPUs
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
     VkDynamicState dyn[32];
     uint32_t n_dyn;
@@ -228,6 +230,10 @@ static int ensure_init(void) {
     }
     VkCtx *c = vk_ctx();
     P.device = c->device;
+    const char *varying = cfg_get("XC2_VARYING_REPAIR");
+    P.varying_repair = c->has_barycentric && (varying ? strcmp(varying, "0") != 0 : c->props.vendorID != 0x10de);
+    rt_log("vk: cloud-sea interpolation repair %s (fragmentShaderBarycentric %d, XC2_VARYING_REPAIR)",
+           P.varying_repair ? "on" : "off", c->has_barycentric);
     VkPhysicalDevicePushDescriptorPropertiesKHR pd = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pd};
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
@@ -1241,7 +1247,7 @@ typedef struct {                       // normalized: zero where the state is dy
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
-    uint8_t blend_en, dsb, fbl, pad;  // dsb: an enabled target blends with a SRC1 factor; fbl: VkPipeState.feedback
+    uint8_t blend_en, dsb, fbl, varying;  // varying: paired shaders use original-vertex interpolation
     uint32_t wmask;
     uint8_t blend[8][6];               // src, dst, op, src alpha, dst alpha, alpha op (VkBlendFactor / VkBlendOp)
     uint32_t attr_fmt[32], attr_off[32];
@@ -1297,6 +1303,9 @@ static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
     k->vs = s->vs, k->fs = s->fs;
     k->indep = (uint8_t)P.indep;
+    k->varying = P.varying_repair && s->fs && s->samples <= 1 && !s->raster_discard &&
+                 s->poly.cull == NVN_FACE_NONE && s->poly.mode == NVN_POLYGON_MODE_FILL &&
+                 (s->prim == NVN_DRAW_PRIMITIVE_QUADS || s->prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP);
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
     int d, st;
@@ -1363,8 +1372,21 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
-    uint32_t *vpatched = NULL, *fpatched = NULL;
-    if (l->set1) {   // independent layouts: outputs from the vertex shader's union, not from this fragment shader
+    const uint32_t *fbase = s->fs ? gfx_shader_spirv(s->fs, &fw) : NULL;
+    uint32_t *vpaired = NULL, *fpaired = NULL, *vpatched = NULL, *fpatched = NULL;
+    int repaired = 0;
+    if (k->varying) {
+        const VkPhysicalDeviceLimits *limits = &vk_ctx()->props.limits;
+        unsigned slots = (limits->maxVertexOutputComponents < limits->maxFragmentInputComponents
+                           ? limits->maxVertexOutputComponents : limits->maxFragmentInputComponents) / 4;
+        size_t vn = 0, fn = 0;
+        repaired = vk_varying_rewrite(vcode, (size_t)vw, fbase, (size_t)fw, slots, &vpaired, &vn, &fpaired, &fn);
+        if (repaired) {
+            vcode = vpaired, vw = vn, fbase = fpaired, fw = fn;
+            LOG_ONCE("vk: cloud-sea interpolation: repaired %d smooth inputs in a shader pair", repaired);
+        } else LOG_ONCE("vk: cloud-sea interpolation: an unsupported shader pair keeps its original interpolation");
+    }
+    if (l->set1 && !repaired) {   // repaired shaders are paired; their spare output is not part of the union
         GfxShaderIo fin[32];
         uint32_t missing = vs_union_missing(s, fin);
         if (missing) {
@@ -1383,13 +1405,13 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             else if (vout[i].type != fin[i].type)
                 LOG_ONCE("vk_pipeline: varying %d is type %d in the vertex stage, %d in the fragment stage", i, vout[i].type, fin[i].type);
         }
-        if (missing && !l->set1) {
+        if (missing && (!l->set1 || repaired)) {
             uint64_t n2 = 0;
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
             else vcode = vpatched, vw = n2;
         }
-        const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
+        const uint32_t *fcode = fbase;
         if (k->dsb) {
             uint64_t n2 = 0;
             uint32_t *d = spirv_dual_source(fcode, fw, &n2);
@@ -1406,6 +1428,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     vm = make_module(vcode, vw);
     free(vpatched), free(fpatched);
+    free(vpaired), free(fpaired);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm)) goto out;
 
@@ -1794,7 +1817,9 @@ static void lib_keys(const VkPipeState *s, const GKey *k, ViKey *v, PrKey *pk, F
 static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc, int build, int *final) {
     Layout *l = (Layout *)lc;
     *final = 1;
-    if (!l->set1 || k->fbl) return VK_NULL_HANDLE;
+    // These stages depend on each other. Build their few pipelines monolithically instead of reusing independent
+    // shader libraries whose keys intentionally contain only one stage.
+    if (!l->set1 || k->fbl || k->varying) return VK_NULL_HANDLE;
     uint64_t t0 = qpc();
     ViKey vk_;
     PrKey pk;
@@ -2372,7 +2397,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                       : "builds its libraries itself (XC2_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
+    if (p && p->building && P.gpl && !k.varying && !p->info.pipeline && !p->fast_tried && p->lay) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {
